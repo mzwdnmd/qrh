@@ -1,17 +1,8 @@
 import { NavLink, Route, Routes } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 import { dayScore } from "./core/rules";
-import { loadTasks, saveTasks, type StoredDailyTask } from "./core/storage";
-import {
-  loadFlows,
-  getActiveRun,
-  startRun,
-  updateRun,
-  endRun,
-  type EmergencyFlow,
-  type EmergencyRun,
-} from "./core/emergency";
 
+import { loadTasks, saveTasks, type StoredDailyTask } from "./core/storage";
 import {
   loadTemplates,
   saveTemplates,
@@ -22,24 +13,20 @@ import {
   type DailyTask as DailyTaskV2,
 } from "./core/templates";
 
+import {
+  loadFlows,
+  getActiveRun,
+  startRun,
+  updateRun,
+  endRun,
+  type EmergencyFlow,
+  type EmergencyRun,
+} from "./core/emergency";
+
 type TaskType = "check" | "number";
 
-type DailyTask = {
-  id: string;
-  title: string;
-  type: TaskType;
-  target: number | null;
-  actual: number;
-  completed: boolean;
-  is_deleted: boolean;
-
-  // v2字段（用于模板派生/去重）
-  date?: string;
-  source_template_id?: string | null;
-};
-
-function uid() {
-  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+function uid(prefix = "id") {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 function todayYMD() {
@@ -50,22 +37,29 @@ function todayYMD() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-/** 兼容迁移：把旧的 daily tasks（无 date/source_template_id）迁移为今日手动任务 */
+/**
+ * 兼容迁移：
+ * 你早期版本把今日任务存在 life_ops_v01_daily_tasks（storage.ts）里，
+ * 现在我们用 templates.ts 的 daily 结构（带 date/source_template_id）。
+ * 迁移一次后会清空旧 key，避免重复迁移。
+ */
 function migrateOldDailyIfNeeded() {
-  // 旧版本存在 KEY=life_ops_v01_daily_tasks（storage.ts）
-  const old = loadTasks() as any as DailyTask[];
+  const old = loadTasks();
   const hasOld = Array.isArray(old) && old.length > 0;
 
-  // 新版本用 templates.ts 的 loadDaily/saveDaily（同KEY，但结构不同）
   const current = loadDaily();
-  const alreadyMigrated = current.some((t) => !t.source_template_id && t.date);
+  const alreadyHasV2 = current.some((t) => typeof t.date === "string");
 
   if (!hasOld) return;
-  if (alreadyMigrated) return;
+  if (alreadyHasV2) {
+    // 如果已经有 v2 结构了，就直接清掉旧 key，避免以后重复迁移
+    saveTasks([] as StoredDailyTask[]);
+    return;
+  }
 
   const date = todayYMD();
   const migrated: DailyTaskV2[] = old.map((t) => ({
-    id: t.id || uid(),
+    id: t.id ?? uid("day"),
     title: t.title ?? "任务",
     type: t.type ?? "check",
     target: t.target ?? null,
@@ -76,10 +70,7 @@ function migrateOldDailyIfNeeded() {
     source_template_id: null,
   }));
 
-  // 写入新结构
   saveDaily([...migrated, ...current]);
-
-  // 清掉旧结构（避免未来重复迁移）
   saveTasks([] as StoredDailyTask[]);
 }
 
@@ -88,12 +79,15 @@ function TodayPage() {
 
   const [tasks, setTasks] = useState<DailyTaskV2[]>(() => {
     migrateOldDailyIfNeeded();
-    // 先派生模板再读取
     deriveTemplatesForToday();
     return loadDaily();
   });
 
-  // 只显示今天的任务
+  function persistAll(next: DailyTaskV2[]) {
+    setTasks(next);
+    saveDaily(next);
+  }
+
   const todayTasks = useMemo(
     () => tasks.filter((t) => t.date === date && !t.is_deleted),
     [tasks, date]
@@ -101,14 +95,9 @@ function TodayPage() {
 
   const score = useMemo(() => dayScore(todayTasks as any), [todayTasks]);
 
-  function persistAll(next: DailyTaskV2[]) {
-    setTasks(next);
-    saveDaily(next);
-  }
-
   function addTask(type: TaskType) {
     const t: DailyTaskV2 = {
-      id: uid(),
+      id: uid("day"),
       title: type === "check" ? "新勾选任务" : "新数值任务",
       type,
       target: type === "number" ? 1 : null,
@@ -167,19 +156,16 @@ function TodayPage() {
             </div>
 
             <div style={{ marginTop: 10, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-              {t.source_template_id ? (
-                <span style={{ color: "#777" }}>来自模板</span>
-              ) : (
-                <span style={{ color: "#777" }}>手动任务</span>
-              )}
+              <span style={{ color: "#777" }}>{t.source_template_id ? "来自模板" : "手动任务"}</span>
 
-              {t.type === "number" && t.target !== null ? (
+              {t.type === "number" ? (
                 <>
                   <label>
                     target：
                     <input
                       type="number"
-                      value={t.target}
+                      value={t.target ?? ""}
+                      placeholder="可空"
                       onChange={(e) => {
                         const v = e.target.value === "" ? null : Number(e.target.value);
                         update(t.id, { target: v });
@@ -199,10 +185,13 @@ function TodayPage() {
                   </label>
 
                   <span style={{ color: "#555" }}>
-                    完成度：<b>{t.target && t.target > 0 ? (t.actual / t.target).toFixed(3) : (t.completed ? "1" : "0")}</b>
+                    完成度：
+                    <b style={{ marginLeft: 6 }}>
+                      {t.target && t.target > 0 ? (t.actual / t.target).toFixed(3) : t.completed ? "1" : "0"}
+                    </b>
                   </span>
 
-                  {t.target === null ? <span style={{ color: "#777" }}>（未填写 target，按勾选处理）</span> : null}
+                  {t.target === null ? <span style={{ color: "#777" }}>target 空 → 按勾选</span> : null}
                 </>
               ) : (
                 <>
@@ -237,7 +226,7 @@ function TemplatesPage() {
 
   function add(type: TaskType) {
     const t: TemplateTask = {
-      id: `tpl_${uid()}`,
+      id: `tpl_${uid("tpl")}`,
       title: type === "check" ? "每日模板（勾选）" : "每日模板（数值）",
       type,
       target: type === "number" ? 1 : null,
@@ -255,7 +244,7 @@ function TemplatesPage() {
     <div style={{ padding: 20 }}>
       <h2 style={{ marginTop: 0 }}>模板</h2>
       <div style={{ color: "#555", marginBottom: 16 }}>
-        模板会每天自动派生到“今日任务”（按 日期+模板id 去重）。
+        模板会每天自动派生到“今日任务”（按 日期 + 模板id 去重）。
       </div>
 
       <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
@@ -265,7 +254,7 @@ function TemplatesPage() {
 
       {templates.length === 0 ? (
         <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 10 }}>
-          还没有模板。创建后明天（或刷新今日页面派生逻辑）会自动生成今日实例。
+          还没有模板。创建后刷新“今日”页面即可派生。
         </div>
       ) : (
         templates.map((t) => (
@@ -318,12 +307,12 @@ function TemplatesPage() {
                 <input
                   value={t.unit ?? ""}
                   placeholder="可空"
-                  onChange={(e) => update(t.id, { unit: e.target.value || null })}
+                  onChange={(e) => update(t.id, { unit: e.target.value === "" ? null : e.target.value })}
                   style={{ marginLeft: 6, width: 130 }}
                 />
               </label>
 
-              {t.target === null ? <span style={{ color: "#777" }}>target 为空时：派生按勾选处理</span> : null}
+              {t.target === null ? <span style={{ color: "#777" }}>target 空 → 派生按勾选</span> : null}
             </div>
           </div>
         ))
@@ -333,14 +322,14 @@ function TemplatesPage() {
 }
 
 function EmergencyPage() {
-  const [flows, setFlows] = useState<EmergencyFlow[]>(() => loadFlows());
+  const [flows] = useState<EmergencyFlow[]>(() => loadFlows());
   const [selectedFlowId, setSelectedFlowId] = useState<string>(flows[0]?.id ?? "flow_qrh_basic");
   const [activeRun, setActiveRun] = useState<EmergencyRun | null>(() => getActiveRun());
 
-  const flow = useMemo(
-    () => flows.find((f) => f.id === (activeRun?.flow_id ?? selectedFlowId)) ?? null,
-    [flows, activeRun, selectedFlowId]
-  );
+  const flow = useMemo(() => {
+    const id = activeRun?.flow_id ?? selectedFlowId;
+    return flows.find((f) => f.id === id) ?? null;
+  }, [flows, activeRun, selectedFlowId]);
 
   function begin() {
     if (!flow) return;
@@ -377,7 +366,7 @@ function EmergencyPage() {
 
   function finish() {
     if (!activeRun) return;
-    const ended = endRun(activeRun);
+    endRun(activeRun); // 不要赋值给 ended，避免“未使用变量”
     setActiveRun(null);
     alert("已结束本次紧急流程。");
   }
@@ -393,7 +382,7 @@ function EmergencyPage() {
     <div style={{ padding: 20 }}>
       <h2 style={{ marginTop: 0 }}>紧急（QRH）</h2>
       <div style={{ color: "#555", marginBottom: 12 }}>
-        用于“紧急清空/止损”的步骤化流程：可中断、刷新后可恢复。
+        这是“紧急清空/止损”的步骤流程：可中断，刷新后可恢复。
       </div>
 
       <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
@@ -446,11 +435,7 @@ function EmergencyPage() {
                       <div style={{ fontWeight: 600 }}>
                         Step {idx + 1}: {s.text}
                       </div>
-                      {s.caution ? (
-                        <div style={{ marginTop: 6, color: "#7a4" }}>
-                          注意：{s.caution}
-                        </div>
-                      ) : null}
+                      {s.caution ? <div style={{ marginTop: 6, color: "#7a4" }}>注意：{s.caution}</div> : null}
 
                       <textarea
                         disabled={!activeRun}
@@ -473,15 +458,6 @@ function EmergencyPage() {
   );
 }
 
-function Placeholder({ title }: { title: string }) {
-  return (
-    <div style={{ padding: 40 }}>
-      <h2>{title}</h2>
-      <p>这里将会是 {title} 页面内容。</p>
-    </div>
-  );
-}
-
 const linkStyle = ({ isActive }: { isActive: boolean }) => ({
   padding: "8px 12px",
   borderRadius: 8,
@@ -491,9 +467,10 @@ const linkStyle = ({ isActive }: { isActive: boolean }) => ({
 });
 
 export default function App() {
-  // 进站时做一次迁移（仅一次）
   useEffect(() => {
+    // 启动时做一次迁移，且派生一次今日模板（确保首次进入今日也能生成）
     migrateOldDailyIfNeeded();
+    deriveTemplatesForToday();
   }, []);
 
   return (
